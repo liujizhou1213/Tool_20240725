@@ -1356,68 +1356,157 @@ private:
 
 
 //函数封装器
-#include<string>
-#include<memory>
-#include<iostream>
-namespace dsnGeneralTool
-{
-  class FunctionWrap
-  {
+// 实现 index_sequence 和 make_index_sequence 的 C++14 版本
+// 实现 index_sequence 和 make_index_sequence 的 C++14 版本
+namespace custom {
+  template<std::size_t... Ints>
+  struct index_sequence {};
+
+  template<std::size_t N, std::size_t... Ints>
+  struct make_index_sequence_helper : make_index_sequence_helper<N - 1, N - 1, Ints...> {};
+
+  template<std::size_t... Ints>
+  struct make_index_sequence_helper<0, Ints...> {
+    using type = index_sequence<Ints...>;
+  };
+
+  template<std::size_t N>
+  using make_index_sequence = typename make_index_sequence_helper<N>::type;
+}
+
+namespace dsnGeneralTool {
+  // Helper class to get the tuple type and return type of a function
+  template<typename Func>
+  struct FunctionTraits;
+
+  template<typename Ret, typename... Args>
+  struct FunctionTraits<Ret(Args...)> {
+    using TupleType = std::tuple<Args...>;
+    using ReturnType = Ret;
+  };
+
+  template<typename Ret, typename... Args>
+  struct FunctionTraits<Ret(*)(Args...)> : FunctionTraits<Ret(Args...)> {};
+
+  template<typename Ret, typename... Args>
+  struct FunctionTraits<std::function<Ret(Args...)>> : FunctionTraits<Ret(Args...)> {};
+
+  template<typename Func>
+  struct FunctionTraits : FunctionTraits<decltype(&Func::operator())> {};
+
+  template<typename Ret, typename ClassType, typename... Args>
+  struct FunctionTraits<Ret(ClassType::*)(Args...)> : FunctionTraits<Ret(Args...)> {};
+
+  template<typename Ret, typename ClassType, typename... Args>
+  struct FunctionTraits<Ret(ClassType::*)(Args...) const> : FunctionTraits<Ret(Args...)> {};
+
+  template<typename Key>
+  class FunctionWrap {
   public:
+    FunctionWrap() = default;
+    ~FunctionWrap() = default;
+
     template<typename Func>
-    void addFunction(const std::string& name, Func func) {
+    void add(const Key& name, Func func) {
       using TupleType = typename FunctionTraits<Func>::TupleType;
-      func_map[name] = [func](std::shared_ptr<void> args) {
-        callFunc(func, *std::static_pointer_cast<TupleType>(args));
+      using ReturnType = typename FunctionTraits<Func>::ReturnType;
+      func_map[name] = [func](std::shared_ptr<void> args, std::shared_ptr<void> result) {
+        callFunc(func, *std::static_pointer_cast<TupleType>(args), result);
+      };
+    }
+
+    template<typename Ret, typename ClassType, typename... Args>
+    void add(const Key& name, ClassType* instance, Ret(ClassType::* func)(Args...)) {
+      using Func = Ret(ClassType::*)(Args...);
+      add(name, [instance, func](Args... args) {
+        return (instance->*func)(std::forward<Args>(args)...);
+        });
+    }
+
+    template<typename Ret, typename... Args>
+    typename std::enable_if<!std::is_void<Ret>::value, Ret>::type
+      run(const Key& name, Args&&... args) const {
+      auto it = func_map.find(name);
+      if (it == func_map.end()) {
+        std::cerr << "Function not found: " << name << std::endl;
+        throw std::runtime_error("Function not found");
+      }
+
+      using TupleType = std::tuple<std::decay_t<Args>...>;
+      auto argsPtr = std::make_shared<TupleType>(std::forward<Args>(args)...);
+      auto resultPtr = std::make_shared<Ret>();
+
+      it->second(argsPtr, resultPtr);
+      return *resultPtr;
+    }
+
+    template<typename Ret, typename... Args>
+    typename std::enable_if<std::is_void<Ret>::value, void>::type
+      run(const Key& name, Args&&... args) const {
+      auto it = func_map.find(name);
+      if (it == func_map.end()) {
+        std::cerr << "Function not found: " << name << std::endl;
+        throw std::runtime_error("Function not found");
+      }
+
+      using TupleType = std::tuple<std::decay_t<Args>...>;
+      auto argsPtr = std::make_shared<TupleType>(std::forward<Args>(args)...);
+      auto resultPtr = std::shared_ptr<void>(nullptr); // For void return type
+
+      it->second(argsPtr, resultPtr);
+    }
+
+    template<typename Ret, typename... Args>
+    auto operator[](const Key& name) const {
+      return [this, name](Args&&... args) {
+        return this->template run<Ret>(name, std::forward<Args>(args)...);
       };
     }
 
     template<typename... Args>
-    void callFunction(const std::string& name, Args... args) const
-    {
-      auto it = func_map.find(name);
-      if (it == func_map.end()) return;
-      using TupleType = std::tuple<std::decay_t<Args>...>;
-      std::shared_ptr<void> argsPtr = std::make_shared<TupleType>(std::forward<Args>(args)...);
-      it->second(argsPtr);
+    void operator()(const Key& name, Args&&... args) const {
+      run<void>(name, std::forward<Args>(args)...);
     }
 
-  private:
-    std::map<std::string, std::function<void(std::shared_ptr<void>)>> func_map;
+    void clear() { func_map.clear(); }
+    size_t size() const { return func_map.size(); }
 
-    // 函数调用辅助
-    template<typename Func, typename Tuple, size_t... I>
-    static void callFunc(Func func, Tuple args, std::index_sequence<I...>) {
+  private:
+    std::map<Key, std::function<void(std::shared_ptr<void>, std::shared_ptr<void>)>> func_map;
+
+    // Function call helper
+    template<typename Func, typename Tuple, std::size_t... I>
+    static void callFuncImpl(Func func, Tuple args, std::shared_ptr<void> result, custom::index_sequence<I...>, std::true_type) {
       func(std::get<I>(args)...);
     }
 
+    template<typename Func, typename Tuple, std::size_t... I>
+    static void callFuncImpl(Func func, Tuple args, std::shared_ptr<void> result, custom::index_sequence<I...>, std::false_type) {
+      using ReturnType = typename FunctionTraits<Func>::ReturnType;
+      auto res = func(std::get<I>(args)...);
+      *std::static_pointer_cast<ReturnType>(result) = res;
+    }
+
     template<typename Func, typename Tuple>
-    static void callFunc(Func func, Tuple args) {
-      callFunc(func, args, std::make_index_sequence<std::tuple_size<Tuple>::value>{});
+    static void callFunc(Func func, Tuple args, std::shared_ptr<void> result) {
+      using ReturnType = typename FunctionTraits<Func>::ReturnType;
+      callFuncImpl(func, args, result, custom::make_index_sequence<std::tuple_size<Tuple>::value>{}, std::is_void<ReturnType>{});
     }
-
-    // Helper class to get the tuple type of a std::function
-    template<typename Func>
-    struct FunctionTraits;
-
-    template<typename Ret, typename... Args>
-    struct FunctionTraits<std::function<Ret(Args...)>> {
-      using TupleType = std::tuple<Args...>;
-    };
-
-    //()重载
-    template<typename... Args>
-    void operator()(const std::string& name, Args&&... args) const
-    {
-      callFunction(name, std::forward<Args>(args)...);
-    }
-
-    //[]重载
-    auto operator[](const std::string& name) const
-    {
-      return [this, name](auto&&... args) {this->callFunction(name, std::forward<decltype(args)>(args)...); };
-    }
-
   };
-}
-using dsnFuncWrap = dsnGeneralTool::FunctionWrap;
+};
+
+
+template<typename Key>
+using dsnFuncWrap = dsnGeneralTool::FunctionWrap<Key>;
+//使用方式
+//using FunctionWrapper = dsnGeneralTool::FunctionWrap<std::string>;
+//FunctionWrapper funcWrapper;
+//// Use the helper function to add member functions
+//funcWrapper.addFunction("func1", this, &FuncExample::exampleFunc1);
+//funcWrapper.addFunction("func2", this, &FuncExample::exampleFunc2);
+//funcWrapper.addFunction("func3", this, &FuncExample::exampleFunc3);
+//
+//int b = 2;
+//double dValue = funcWrapper.callFunction<double>("func1", 1.5f, std::ref(b));
+//int dValue1 = funcWrapper.callFunction<int>("func2", 3.0, 4, 5);
+//std::string dValue2 = funcWrapper.callFunction<std::string>("func3", 6, 7, 8, 9.0);
